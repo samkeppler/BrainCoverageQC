@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-# =============================================================================
-# Purpose: Calculate brain coverage for each subject's DWI data using ACPC-space
-#          masks and output results under qsiprep/brain_coverage/results.
-# Notes  : This version supports datasets with sessions and writes one CSV per
-#          session (ses-1 and ses-2). Subjects and their sessions are
-#          discovered directly from the qsiprep folder structure on disk.
-# =============================================================================
+"""
+Brain coverage of DWI data within ACPC-space masks (datasets with sessions).
+
+For each subject and session found in a QSIPrep derivatives folder,
+binarizes the time-averaged preprocessed DWI and computes the percentage
+of each ACPC-space brain coverage mask (ICBM152 whole brain, superior
+cerebrum, inferior cerebrum, cerebellum/midbrain) that it covers.
+
+Outputs:
+    - One CSV per session of per-subject coverage (%) for each mask
+"""
 
 import os
 import shutil
@@ -20,78 +24,59 @@ from nipype.interfaces import fsl
 from nipype.interfaces.fsl.maths import MathsCommand
 
 
-CONFIG = {
-    "base_path": "/mnt/synapse/neurocat-lab/R21MH133229_asd_dmri_lifespan/datasets_v1.0",
-    "dataset_name": "nda-collection9",
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+QSIPREP_ROOT = "/path/to/your/qsiprep/derivatives"
+MASKS_ROOT = os.path.join(QSIPREP_ROOT, "brain_coverage")
+OUTPUT_DIR = os.path.join(MASKS_ROOT, "results")
 
-    # Sessions to process. Subjects for each session are always discovered by
-    # scanning qsiprep_root for sub-*/<ses>/ directories.
-    "sessions": ["ses-1", "ses-2"],
+OUTPUT_CSV_TEMPLATE = "brain_coverage_dseg_masks_{ses}.csv"
 
-    # Can be overridden with environment variable DWI_PREFIX.
-    # For this dataset, the DWI file includes the session in its name, e.g.:
-    #   sub-XXXX_ses-1_dir-PA_space-ACPC_desc-preproc_dwi.nii.gz
-    #
-    # We keep dwi_prefix as the non-subject part excluding the leading "{subj}_".
-    # The session token is injected automatically (see find_preproc_dwi()).
-    "dwi_prefix": "dir-PA_space-ACPC",
+# Sessions to process; subjects are discovered per session from
+# QSIPREP_ROOT/sub-*/<ses>/
+SESSIONS = ["ses-1", "ses-2"]
 
-    "paths": {
-        "qsiprep_root": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2",
+# DWI filename part after "<subj>_<ses>_", e.g. for
+# sub-XXXX_ses-1_dir-PA_space-ACPC_desc-preproc_dwi.nii.gz.
+# Can be overridden with the DWI_PREFIX environment variable.
+DWI_PREFIX = "dir-PA_space-ACPC"
 
-        # Output locations
-        "braincov_root": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2/brain_coverage",
-        "results_dir": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2/brain_coverage/results",
+# Mask name -> path template. Also sets the output column order.
+# Mask filenames do not include the session.
+MASK_TEMPLATES = OrderedDict([
+    ("icbm152", "{masks_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_icbm152_brain_coverage_mask.nii.gz"),
+    ("superior_cerebrum", "{masks_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_superior_cerebrum_brain_coverage_mask.nii.gz"),
+    ("inferior_cerebrum", "{masks_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_inferior_cerebrum_brain_coverage_mask.nii.gz"),
+    ("cerebellum_and_midbrain", "{masks_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_cerebellum_and_midbrain_brain_coverage_mask.nii.gz"),
+])
 
-        # We will create one output CSV per session under results_dir
-        "output_csv_template": (
-            "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2/brain_coverage/results/"
-            "brain_coverage_dseg_masks_{ses}.csv"
-        ),
-    },
-
-    # Ordered mask list for deterministic output column order.
-    # For sessioned datasets, masks are located under:
-    #   brain_coverage/<subj>/<ses>/masks/
-    # and mask filenames do NOT include the session token.
-    "mask_templates": OrderedDict([
-        ("icbm152", "{braincov_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_icbm152_brain_coverage_mask.nii.gz"),
-        ("superior_cerebrum", "{braincov_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_superior_cerebrum_brain_coverage_mask.nii.gz"),
-        ("inferior_cerebrum", "{braincov_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_inferior_cerebrum_brain_coverage_mask.nii.gz"),
-        ("cerebellum_and_midbrain", "{braincov_root}/{subj}/{ses}/masks/{subj}_space-ACPC_mni_cerebellum_and_midbrain_brain_coverage_mask.nii.gz"),
-    ]),
-
-    "options": {
-        "allow_wildcard_fallback": True,
-        "keep_intermediates": False,
-        "verbose": True,
-    }
-}
+# Use the first matching DWI file if the expected filename is not found
+ALLOW_WILDCARD_FALLBACK = True
+KEEP_INTERMEDIATES = False
+VERBOSE = True
 
 
-def count_nonzero_voxels(img_path: str) -> float:
-    data = nib.load(img_path).get_fdata()
-    return float((data != 0).sum())
-
-
-def get_subject_list_for_session(qsiprep_root: str, ses: str):
-    """Discover subjects for a given session by scanning qsiprep_root for
-    sub-*/<ses>/ directories."""
+# ----------------------------------------------------------------------
+# FILE DISCOVERY
+# ----------------------------------------------------------------------
+def get_subject_list(qsiprep_root: str, ses: str):
+    """Return sorted subject folder names that contain the given session."""
     subs = sorted(
         os.path.basename(p)
         for p in glob(os.path.join(qsiprep_root, "sub-*"))
         if os.path.isdir(p) and os.path.isdir(os.path.join(p, ses))
     )
+    if not subs:
+        raise RuntimeError(f"No subject folders with {ses} found under: {qsiprep_root}")
     return subs
 
 
 def find_preproc_dwi(subj: str, ses: str, qsiprep_root: str, dwi_prefix: str, allow_fallback: bool) -> Optional[str]:
-    """
-    Expected sessioned filename:
-      <qsiprep_root>/<subj>/<ses>/dwi/<subj>_<ses>_<dwi_prefix>_desc-preproc_dwi.nii.gz
-    Example:
-      sub-NDARAF078EUY_ses-1_dir-PA_space-ACPC_desc-preproc_dwi.nii.gz
-    """
+    """Return the preprocessed DWI for a subject/session, expected at
+    <subj>/<ses>/dwi/<subj>_<ses>_<dwi_prefix>_desc-preproc_dwi.nii.gz.
+    If missing and allow_fallback is set, returns the first file matching
+    <subj>_<ses>_*_desc-preproc_dwi.nii.gz; otherwise None."""
     expected = os.path.join(
         qsiprep_root, subj, ses, "dwi",
         f"{subj}_{ses}_{dwi_prefix}_desc-preproc_dwi.nii.gz",
@@ -105,21 +90,31 @@ def find_preproc_dwi(subj: str, ses: str, qsiprep_root: str, dwi_prefix: str, al
     pattern = os.path.join(qsiprep_root, subj, ses, "dwi", f"{subj}_{ses}_*_desc-preproc_dwi.nii.gz")
     candidates = sorted(glob(pattern))
     if candidates:
-        print(f"  [WARN] Expected DWI not found for {subj} {ses}.")
+        print(f"  [WARN] Expected DWI not found for {subj} {ses} (expected: {os.path.basename(expected)}).")
         print(f"         Falling back to first match: {os.path.basename(candidates[0])}")
         return candidates[0]
 
     return None
 
 
-def compute_coverage(subj: str, ses: str, dwi_file: str, mask_file: str, work_dir: str) -> Optional[float]:
+# ----------------------------------------------------------------------
+# COVERAGE
+# ----------------------------------------------------------------------
+def count_nonzero_voxels(img_path: str) -> float:
+    """Count nonzero voxels in a NIfTI image."""
+    data = nib.load(img_path).get_fdata()
+    return float((data != 0).sum())
+
+
+def binarize_mean_dwi(subj: str, ses: str, dwi_file: str, work_dir: str) -> Optional[str]:
+    """Convert the DWI to float, average over time, and binarize. Returns
+    the binarized image path, or None if the float conversion fails."""
     subj_tmp = os.path.join(work_dir, ses, subj)
     os.makedirs(subj_tmp, exist_ok=True)
 
     dwi_float = os.path.join(subj_tmp, f"{subj}_{ses}_dwi_float.nii.gz")
     dwi_mean = os.path.join(subj_tmp, f"{subj}_{ses}_dwi_meanT.nii.gz")
     dwi_mean_bin = os.path.join(subj_tmp, f"{subj}_{ses}_dwi_meanT_bin.nii.gz")
-    masked = os.path.join(subj_tmp, f"{subj}_{ses}_masked.nii.gz")
 
     MathsCommand(
         in_file=dwi_file,
@@ -145,6 +140,14 @@ def compute_coverage(subj: str, ses: str, dwi_file: str, mask_file: str, work_di
         output_type="NIFTI_GZ"
     ).run()
 
+    return dwi_mean_bin
+
+
+def compute_coverage(subj: str, ses: str, mask_name: str, dwi_mean_bin: str, mask_file: str, work_dir: str) -> Optional[float]:
+    """Percent of mask voxels covered by the binarized DWI, rounded to
+    3 decimals. Returns None if masking fails or the mask is empty."""
+    masked = os.path.join(work_dir, ses, subj, f"{subj}_{ses}_{mask_name}_masked.nii.gz")
+
     fsl.ApplyMask(
         in_file=dwi_mean_bin,
         mask_file=mask_file,
@@ -163,38 +166,32 @@ def compute_coverage(subj: str, ses: str, dwi_file: str, mask_file: str, work_di
     return round((n_cov / n_mask) * 100.0, 3)
 
 
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
 def main():
-    base = CONFIG["base_path"]
-    dataset = CONFIG["dataset_name"]
-
-    dwi_prefix = os.environ.get("DWI_PREFIX", CONFIG["dwi_prefix"])
-
-    qsiprep_root = CONFIG["paths"]["qsiprep_root"].format(base=base, dataset=dataset)
-    braincov_root = CONFIG["paths"]["braincov_root"].format(base=base, dataset=dataset)
-    results_dir = CONFIG["paths"]["results_dir"].format(base=base, dataset=dataset)
-    os.makedirs(results_dir, exist_ok=True)
-
-    work_dir = os.path.join(results_dir, "tmp")
-    os.makedirs(work_dir, exist_ok=True)
-
     start = datetime.now()
     print(f"Started at {start}")
-    print(f"Dataset: {dataset}")
-    print(f"QSIPrep root: {qsiprep_root}")
-    print(f"BrainCov root: {braincov_root}")
-    print(f"DWI prefix (sessioned): {dwi_prefix}")
-    print(f"Allow wildcard fallback: {CONFIG['options']['allow_wildcard_fallback']}")
 
-    for ses in CONFIG["sessions"]:
-        out_csv = CONFIG["paths"]["output_csv_template"].format(base=base, dataset=dataset, ses=ses)
+    dwi_prefix = os.environ.get("DWI_PREFIX", DWI_PREFIX)
 
-        # Build mask templates with session in path
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    work_dir = os.path.join(OUTPUT_DIR, "tmp")
+    os.makedirs(work_dir, exist_ok=True)
+
+    print(f"QSIPrep root: {QSIPREP_ROOT}")
+    print(f"Masks root: {MASKS_ROOT}")
+    print(f"DWI prefix: {dwi_prefix} (allow fallback: {ALLOW_WILDCARD_FALLBACK})")
+
+    for ses in SESSIONS:
+        out_csv = os.path.join(OUTPUT_DIR, OUTPUT_CSV_TEMPLATE.format(ses=ses))
+
         mask_templates = OrderedDict(
-            (k, v.format(braincov_root=braincov_root, subj="{subj}", ses=ses))
-            for k, v in CONFIG["mask_templates"].items()
+            (k, v.format(masks_root=MASKS_ROOT, subj="{subj}", ses=ses))
+            for k, v in MASK_TEMPLATES.items()
         )
 
-        subjects = get_subject_list_for_session(qsiprep_root, ses)
+        subjects = get_subject_list(QSIPREP_ROOT, ses)
         total = len(subjects)
 
         print(f"\n--- Processing {ses} ({total} subjects) ---")
@@ -207,9 +204,9 @@ def main():
             dwi_file = find_preproc_dwi(
                 subj=subj,
                 ses=ses,
-                qsiprep_root=qsiprep_root,
+                qsiprep_root=QSIPREP_ROOT,
                 dwi_prefix=dwi_prefix,
-                allow_fallback=CONFIG["options"]["allow_wildcard_fallback"],
+                allow_fallback=ALLOW_WILDCARD_FALLBACK,
             )
 
             row = {"participant_id": subj}
@@ -220,25 +217,30 @@ def main():
                 rows.append(row)
                 continue
 
+            dwi_mean_bin = binarize_mean_dwi(subj, ses, dwi_file, work_dir)
+
             for name, tmpl in mask_templates.items():
                 mask_file = tmpl.format(subj=subj)
 
                 if not os.path.exists(mask_file):
-                    if CONFIG["options"]["verbose"]:
+                    if VERBOSE:
                         print(f"  [WARN] Missing mask for {subj} {ses}: {mask_file}")
                     row[f"coverage_{name}"] = None
                     continue
 
-                row[f"coverage_{name}"] = compute_coverage(subj, ses, dwi_file, mask_file, work_dir)
+                if dwi_mean_bin is None:
+                    row[f"coverage_{name}"] = None
+                    continue
+
+                row[f"coverage_{name}"] = compute_coverage(subj, ses, name, dwi_mean_bin, mask_file, work_dir)
 
             rows.append(row)
 
-            if not CONFIG["options"]["keep_intermediates"]:
+            if not KEEP_INTERMEDIATES:
                 shutil.rmtree(os.path.join(work_dir, ses, subj), ignore_errors=True)
 
         df = pd.DataFrame(rows)
 
-        # Enforce deterministic column order in output CSV
         ordered_cols = ["participant_id"] + [f"coverage_{k}" for k in mask_templates.keys()]
         df = df.reindex(columns=ordered_cols)
 
@@ -247,7 +249,7 @@ def main():
 
     print(f"\nTotal runtime: {datetime.now() - start}")
 
-    if not CONFIG["options"]["keep_intermediates"]:
+    if not KEEP_INTERMEDIATES:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 

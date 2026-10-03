@@ -1,59 +1,59 @@
 #!/bin/bash
+# =============================================================================
+# Transform MNI-space brain coverage masks into subject ACPC space.
+#
+# For every subject/session in a QSIPrep derivatives folder, applies the
+# QSIPrep-generated MNI152NLin2009cAsym -> ACPC composite transform to four
+# region masks (ICBM152 whole brain, superior cerebrum, inferior cerebrum,
+# cerebellum/midbrain), using the session's ACPC-space dwiref as reference.
+#
+# Outputs:
+#   - Per subject/session: four ACPC-space masks in
+#     OUTPUT_DIR/sub-<id>/ses-<id>/masks/sub-<id>_space-ACPC_<mask>.nii.gz
+#
+# Requirements:
+#   - bash 4+ (associative arrays)
+#   - Docker (runs antsApplyTransforms from the ANTs image)
+# =============================================================================
+
 set -euo pipefail
 
-# =============================================================================
-# Purpose:
-#   Transform atlas-derived MNI152NLin2009cAsym region masks into each subject's
-#   ACPC-space diffusion reference (dwiref) using the QSIPrep-generated
-#   MNI→ACPC composite transform.
-#
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
-declare -A CONFIG
-CONFIG=(
-  # QSIPrep derivatives roo
-  ["qsiprep_root"]="/mnt/synapse/neurocat-lab/R21MH133229_asd_dmri_lifespan/datasets_v1.0/nda-collection9/derivatives/qsiprep-1.0.0rc2"
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+QSIPREP_ROOT="/path/to/your/qsiprep/derivatives"
+MNI_MASKS_DIR="/path/to/your/mni/masks/folder"
+ICBM152_MASK_FILE="/path/to/your/icbm152/mni_icbm152_t1_tal_nlin_asym_09c_mask.nii"
+OUTPUT_DIR="${QSIPREP_ROOT}/brain_coverage"
 
-  # Directory containing the dseg-derived masks (MNI space)
-  ["mni_masks_dir"]="/mnt/synapse/neurocat-lab/atlases/MNI152NLin2009cAsym_res-01_dseg_masks"
+ANTS_DOCKER_IMAGE="antsx/ants:2.5.3"
 
-  # icbm152 mask (single file)
-  ["icbm152_mask_file"]="/mnt/synapse/neurocat-lab/atlases/mni_icbm152_nlin_asym_09c/mni_icbm152_t1_tal_nlin_asym_09c_mask.nii"
+# Nearest-neighbor keeps transformed masks binary
+INTERP="NearestNeighbor"
 
-  # Docker image containing antsApplyTransforms
-  ["ants_docker_image"]="antsx/ants:2.5.3"
-
-  # Interpolation for label/binary masks
-  ["interp"]="NearestNeighbor"
-)
-
-# =============================================================================
-# MASK DEFINITIONS
-# =============================================================================
-
+# Input masks; "__ICBM152__" refers to ICBM152_MASK_FILE
 MASKS=(
+  "__ICBM152__"
   "MNI152NLin2009cAsym_superior_cerebrum.nii.gz"
   "MNI152NLin2009cAsym_inferior_cerebrum.nii.gz"
   "MNI152NLin2009cAsym_cerebellum+midbrain.nii.gz"
-  "__ICBM152__"
 )
 
+# Input mask stem -> output file tag
 declare -A OUTTAG=(
+  ["__ICBM152__"]="mni_icbm152_brain_coverage_mask"
   ["MNI152NLin2009cAsym_superior_cerebrum"]="mni_superior_cerebrum_brain_coverage_mask"
   ["MNI152NLin2009cAsym_inferior_cerebrum"]="mni_inferior_cerebrum_brain_coverage_mask"
   ["MNI152NLin2009cAsym_cerebellum+midbrain"]="mni_cerebellum_and_midbrain_brain_coverage_mask"
-  ["__ICBM152__"]="mni_icbm152_brain_coverage_mask"
 )
 
-# =============================================================================
-# HELPERS
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# FILE DISCOVERY
+# -----------------------------------------------------------------------------
 die () { echo "ERROR: $*" 1>&2; exit 1; }
 
-# Return all sessions for subject (e.g., "ses-1 ses-2"), or "" if none.
+# Return all sessions for a subject (e.g., "ses-1 ses-2"), or "" if none.
 list_sessions () {
   local qsiprep_root="$1"
   local subj="$2"
@@ -66,7 +66,7 @@ list_sessions () {
   for d in $hit; do basename "$d"; done
 }
 
-# Prefer ses-1 if present, else first ses-*
+# Return ses-1 if present, else the first session found.
 default_session () {
   local qsiprep_root="$1"
   local subj="$2"
@@ -85,7 +85,7 @@ default_session () {
   echo "$s" | awk '{print $1}'
 }
 
-# Find dwiref for subject + session.
+# Return the ACPC-space dwiref for a subject/session, or "" if not found.
 find_dwiref () {
   local qsiprep_root="$1"
   local subj="$2"
@@ -116,7 +116,8 @@ find_dwiref () {
   echo "$hit"
 }
 
-# transform is subject-level (NOT session-level)
+# Return the MNI -> ACPC transform. QSIPrep writes it at the subject level
+# (shared across sessions), not per session.
 find_subject_level_xfm () {
   local qsiprep_root="$1"
   local subj="$2"
@@ -128,6 +129,11 @@ find_subject_level_xfm () {
   echo ""
 }
 
+
+# -----------------------------------------------------------------------------
+# TRANSFORMS
+# -----------------------------------------------------------------------------
+# Apply the MNI -> ACPC transform to one mask with antsApplyTransforms in Docker.
 apply_xfm_mni2acpc_mask_docker () {
   local xfm_dir="$1"
   local xfm_name="$2"
@@ -158,7 +164,7 @@ apply_xfm_mni2acpc_mask_docker () {
     -v "$out_dir":/output \
     -v "$xfm_dir":/xfm:ro \
     -v "$ref_dir":/ref:ro \
-    "${CONFIG[ants_docker_image]}" \
+    "${ANTS_DOCKER_IMAGE}" \
     antsApplyTransforms \
       -i "/input/$in_base" \
       -t "/xfm/$xfm_name" \
@@ -167,19 +173,19 @@ apply_xfm_mni2acpc_mask_docker () {
       -n "$interp"
 }
 
-# =============================================================================
-# MAIN
-# =============================================================================
 
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 main () {
   command -v docker >/dev/null 2>&1 || die "docker not found in PATH"
 
-  local qsiprep_root="${CONFIG[qsiprep_root]}"
-  [[ -d "$qsiprep_root" ]] || die "qsiprep_root not found: $qsiprep_root"
-  [[ -d "${CONFIG[mni_masks_dir]}" ]] || die "mni_masks_dir not found: ${CONFIG[mni_masks_dir]}"
-  [[ -f "${CONFIG[icbm152_mask_file]}" ]] || die "icbm152 mask not found: ${CONFIG[icbm152_mask_file]}"
+  local qsiprep_root="${QSIPREP_ROOT}"
+  [[ -d "$qsiprep_root" ]] || die "QSIPREP_ROOT not found: $qsiprep_root"
+  [[ -d "${MNI_MASKS_DIR}" ]] || die "MNI_MASKS_DIR not found: ${MNI_MASKS_DIR}"
+  [[ -f "${ICBM152_MASK_FILE}" ]] || die "ICBM152 mask not found: ${ICBM152_MASK_FILE}"
 
-  local braincov_root="${qsiprep_root}/brain_coverage"
+  local braincov_root="${OUTPUT_DIR}"
   mkdir -p "$braincov_root"
 
   local subj_dir subj
@@ -188,8 +194,7 @@ main () {
     subj="$(basename "$subj_dir")"
     subj="${subj#sub-}"
 
-    # Discover all sessions this subject actually has on disk (e.g.
-    # "ses-1 ses-2") instead of relying on a static ses-2 subject list file.
+    # Process every session found on disk for this subject
     local all_sessions
     all_sessions="$(list_sessions "$qsiprep_root" "$subj")"
     if [[ -z "$all_sessions" ]]; then
@@ -197,7 +202,7 @@ main () {
       continue
     fi
 
-    # De-duplicate (list_sessions shouldn't produce dupes, but stay safe)
+    # De-duplicate sessions
     local uniq=()
     for s in $all_sessions; do
       local seen="false"
@@ -205,7 +210,6 @@ main () {
       [[ "$seen" == "false" ]] && uniq+=("$s")
     done
 
-    # Subject-level transform (shared across sessions)
     local xfm_path
     xfm_path="$(find_subject_level_xfm "$qsiprep_root" "$subj")"
     if [[ -z "$xfm_path" ]]; then
@@ -238,17 +242,17 @@ main () {
         local in_file stem tag out_file
 
         if [[ "$mask_key" == "__ICBM152__" ]]; then
-          in_file="${CONFIG[icbm152_mask_file]}"
+          in_file="${ICBM152_MASK_FILE}"
           stem="__ICBM152__"
         else
-          in_file="${CONFIG[mni_masks_dir]}/${mask_key}"
+          in_file="${MNI_MASKS_DIR}/${mask_key}"
           stem="${mask_key%.nii.gz}"
         fi
 
         tag="${OUTTAG[$stem]}"
         out_file="${out_mask_dir}/sub-${subj}_space-ACPC_${tag}.nii.gz"
 
-        # overwrite on rerun
+        # Overwrite on rerun
         rm -f "$out_file"
 
         apply_xfm_mni2acpc_mask_docker \
@@ -257,7 +261,7 @@ main () {
           "$in_file" \
           "$out_file" \
           "$ref_file" \
-          "${CONFIG[interp]}"
+          "${INTERP}"
 
         echo "  Wrote: $out_file"
       done

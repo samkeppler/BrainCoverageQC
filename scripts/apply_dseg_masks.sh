@@ -1,80 +1,101 @@
 #!/bin/bash
+# =============================================================================
+# Transform MNI-space brain coverage masks into subject ACPC space
+# (datasets without session folders).
+#
+# For every subject in a QSIPrep derivatives folder, applies the
+# QSIPrep-generated MNI152NLin2009cAsym -> ACPC composite transform to four
+# region masks (ICBM152 whole brain, superior cerebrum, inferior cerebrum,
+# cerebellum/midbrain), using the subject's ACPC-space dwiref as reference.
+#
+# Outputs:
+#   - Per subject: four ACPC-space masks in
+#     OUTPUT_DIR/sub-<id>/masks/sub-<id>_space-ACPC_<mask>.nii.gz
+#
+# Requirements:
+#   - bash 4+ (associative arrays)
+#   - Docker (runs antsApplyTransforms from the ANTs image)
+# =============================================================================
+
 set -euo pipefail
 
-# =============================================================================
-# Purpose:
-#   Transform atlas-derived MNI152NLin2009cAsym region masks into each subject's
-#   ACPC-space diffusion reference (dwiref) using the QSIPrep-generated
-#   MNI->ACPC composite transform.
-#
-#   Outputs 4 masks per subject:
-#     1. cerebellum + midbrain
-#     2. ICBM152
-#     3. inferior cerebrum
-#     4. superior cerebrum
-#
-# =============================================================================
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+QSIPREP_ROOT="/path/to/your/qsiprep/derivatives"
+MNI_MASKS_DIR="/path/to/your/mni/masks/folder"
+ICBM152_MASK_FILE="/path/to/your/icbm152/mni_icbm152_t1_tal_nlin_asym_09c_mask.nii"
+OUTPUT_DIR="${QSIPREP_ROOT}/brain_coverage"
 
-declare -A CONFIG
-CONFIG=(
-  # Core identifier
-  ["dataset_name"]="abideii-bni"
+# {subj} is replaced with the subject ID
+XFM_NAME_TEMPLATE="sub-{subj}_from-MNI152NLin2009cAsym_to-ACPC_mode-image_xfm.h5"
 
-  # Base paths
-  ["base_path"]="/mnt/synapse/neurocat-lab/R21MH133229_asd_dmri_lifespan/datasets_v1.0"
-  ["atlas_dir"]="/mnt/synapse/neurocat-lab/atlases"
+ANTS_DOCKER_IMAGE="antsx/ants:2.5.3"
 
-  # Derived paths
-  ["bids_dir"]=""              # set after declaration
-  ["mni_masks_dir"]=""         # set after declaration
-  ["icbm152_mask_file"]=""     # set after declaration
+# Nearest-neighbor keeps transformed masks binary
+INTERP="NearestNeighbor"
 
-  # Transform + runtime
-  ["xfm_name_template"]="sub-{subj}_from-MNI152NLin2009cAsym_to-ACPC_mode-image_xfm.h5"
-  ["ants_docker_image"]="antsx/ants:2.5.3"
-  ["interp"]="NearestNeighbor"
-)
-
-# Resolve derived paths
-CONFIG["bids_dir"]="${CONFIG[base_path]}/${CONFIG[dataset_name]}"
-CONFIG["mni_masks_dir"]="${CONFIG[atlas_dir]}/MNI152NLin2009cAsym_res-01_dseg_masks"
-CONFIG["icbm152_mask_file"]="${CONFIG[atlas_dir]}/mni_icbm152_nlin_asym_09c/mni_icbm152_t1_tal_nlin_asym_09c_mask.nii"
-
-# =============================================================================
-# MASK DEFINITIONS
-# =============================================================================
-
+# Input masks; "__ICBM152__" refers to ICBM152_MASK_FILE
 MASKS=(
-  "MNI152NLin2009cAsym_cerebellum+midbrain.nii.gz"
   "__ICBM152__"
-  "MNI152NLin2009cAsym_inferior_cerebrum.nii.gz"
   "MNI152NLin2009cAsym_superior_cerebrum.nii.gz"
+  "MNI152NLin2009cAsym_inferior_cerebrum.nii.gz"
+  "MNI152NLin2009cAsym_cerebellum+midbrain.nii.gz"
 )
 
+# Input mask stem -> output file tag
 declare -A OUTTAG=(
-  ["MNI152NLin2009cAsym_cerebellum+midbrain"]="mni_cerebellum_and_midbrain_brain_coverage_mask"
   ["__ICBM152__"]="mni_icbm152_brain_coverage_mask"
-  ["MNI152NLin2009cAsym_inferior_cerebrum"]="mni_inferior_cerebrum_brain_coverage_mask"
   ["MNI152NLin2009cAsym_superior_cerebrum"]="mni_superior_cerebrum_brain_coverage_mask"
+  ["MNI152NLin2009cAsym_inferior_cerebrum"]="mni_inferior_cerebrum_brain_coverage_mask"
+  ["MNI152NLin2009cAsym_cerebellum+midbrain"]="mni_cerebellum_and_midbrain_brain_coverage_mask"
 )
 
-# =============================================================================
-# FUNCTIONS
-# =============================================================================
-
+# -----------------------------------------------------------------------------
+# FILE DISCOVERY
+# -----------------------------------------------------------------------------
 die () {
   echo "ERROR: $*" 1>&2
   exit 1
 }
 
-qsiprep_dir () {
-  echo "${CONFIG[bids_dir]}/derivatives/qsiprep-1.0.0rc2"
+# Print subject IDs (without the "sub-" prefix), one per line, sorted.
+get_subject_list () {
+  local qsiprep_dir_path="$1"
+  local subj_dir base
+
+  for subj_dir in "${qsiprep_dir_path}"/sub-*/; do
+    [[ -d "$subj_dir" ]] || continue
+    base="$(basename "$subj_dir")"
+    echo "${base#sub-}"
+  done | sort
 }
 
+# Return the ACPC-space dwiref for a subject, or "" if not found.
+find_dwiref () {
+  local qsiprep_dir_path="$1"
+  local subj="$2"
+  local dwi_dir="${qsiprep_dir_path}/sub-${subj}/dwi"
+
+  local hit
+  hit=$(ls -1 "${dwi_dir}/sub-${subj}"_dir-*_space-ACPC_dwiref.nii.gz 2>/dev/null | head -n 1 || true)
+  [[ -n "$hit" ]] && { echo "$hit"; return; }
+
+  hit="${dwi_dir}/sub-${subj}_space-ACPC_dwiref.nii.gz"
+  [[ -f "$hit" ]] && { echo "$hit"; return; }
+
+  hit=$(ls -1 "${dwi_dir}/sub-${subj}"*_space-ACPC_dwiref.nii.gz 2>/dev/null | head -n 1 || true)
+  [[ -n "$hit" ]] && { echo "$hit"; return; }
+
+  echo ""
+}
+
+
+# -----------------------------------------------------------------------------
+# TRANSFORMS
+# -----------------------------------------------------------------------------
+# Apply the MNI -> ACPC transform to one mask with antsApplyTransforms in Docker.
 apply_xfm_mni2acpc_mask_docker () {
   local qsiprep_dir_path="$1"
   local subj="$2"
@@ -85,10 +106,9 @@ apply_xfm_mni2acpc_mask_docker () {
 
   [[ -f "$in_file" ]] || { echo "Skipping - missing input: $in_file"; return 0; }
   [[ -f "$ref_file" ]] || { echo "Skipping - missing reference: $ref_file"; return 0; }
-  [[ -f "$out_file" ]] && { echo "Skipping - exists: $out_file"; return 0; }
 
   local xfm_dir="${qsiprep_dir_path}/sub-${subj}/anat"
-  local xfm_name="${CONFIG[xfm_name_template]//\{subj\}/$subj}"
+  local xfm_name="${XFM_NAME_TEMPLATE//\{subj\}/$subj}"
   local xfm_path="${xfm_dir}/${xfm_name}"
 
   [[ -f "$xfm_path" ]] || { echo "Skipping - missing transform: $xfm_path"; return 0; }
@@ -109,7 +129,7 @@ apply_xfm_mni2acpc_mask_docker () {
     -v "$out_dir":/output \
     -v "$xfm_dir":/xfm:ro \
     -v "$ref_dir":/ref:ro \
-    "${CONFIG[ants_docker_image]}" \
+    "${ANTS_DOCKER_IMAGE}" \
     antsApplyTransforms \
       -i "/input/$(basename "$in_file")" \
       -t "/xfm/$xfm_name" \
@@ -120,88 +140,9 @@ apply_xfm_mni2acpc_mask_docker () {
   echo "Wrote: $out_file"
 }
 
-get_subject_list () {
-  local qsiprep_dir_path="$1"
-  local subj_dir base
 
-  for subj_dir in "${qsiprep_dir_path}"/sub-*/; do
-    [[ -d "$subj_dir" ]] || continue
-    base="$(basename "$subj_dir")"
-    echo "${base#sub-}"
-  done | sort
-}
-
-find_dwiref () {
-  local qsiprep_dir_path="$1"
-  local subj="$2"
-  local dwi_dir="${qsiprep_dir_path}/sub-${subj}/dwi"
-
-  local hit
-  hit=$(ls -1 ${dwi_dir}/sub-${subj}_dir-*_space-ACPC_dwiref.nii.gz 2>/dev/null | head -n 1 || true)
-  [[ -n "$hit" ]] && { echo "$hit"; return; }
-
-  hit="${dwi_dir}/sub-${subj}_space-ACPC_dwiref.nii.gz"
-  [[ -f "$hit" ]] && { echo "$hit"; return; }
-
-  hit=$(ls -1 ${dwi_dir}/sub-${subj}*_space-ACPC_dwiref.nii.gz 2>/dev/null | head -n 1 || true)
-  [[ -n "$hit" ]] && { echo "$hit"; return; }
-
-  echo ""
-}
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # MAIN
-# =============================================================================
-
+# -----------------------------------------------------------------------------
 main () {
-  command -v docker >/dev/null 2>&1 || die "docker not found"
-
-  local qsiprep_dir_path
-  qsiprep_dir_path="$(qsiprep_dir)"
-
-  [[ -d "${CONFIG[bids_dir]}" ]] || die "Missing bids_dir"
-  [[ -d "$qsiprep_dir_path" ]] || die "Missing qsiprep_dir"
-
-  local out_root="${qsiprep_dir_path}/brain_coverage"
-
-  local subjects
-  subjects="$(get_subject_list "$qsiprep_dir_path")"
-  [[ -n "$subjects" ]] || die "No sub-* directories found under $qsiprep_dir_path"
-
-  while read -r subj; do
-    [[ -z "$subj" ]] && continue
-
-    local ref_file
-    ref_file="$(find_dwiref "$qsiprep_dir_path" "$subj")"
-    [[ -z "$ref_file" ]] && { echo "Skipping sub-${subj} (no dwiref)"; continue; }
-
-    local mask_dir="${out_root}/sub-${subj}/masks"
-    mkdir -p "$mask_dir"
-
-    for mask_key in "${MASKS[@]}"; do
-      local in_file stem tag out_file
-
-      if [[ "$mask_key" == "__ICBM152__" ]]; then
-        in_file="${CONFIG[icbm152_mask_file]}"
-        stem="__ICBM152__"
-      else
-        in_file="${CONFIG[mni_masks_dir]}/${mask_key}"
-        stem="${mask_key%.nii.gz}"
-      fi
-
-      tag="${OUTTAG[$stem]}"
-      out_file="${mask_dir}/sub-${subj}_space-ACPC_${tag}.nii.gz"
-
-      apply_xfm_mni2acpc_mask_docker \
-        "$qsiprep_dir_path" \
-        "$subj" \
-        "$in_file" \
-        "$out_file" \
-        "$ref_file" \
-        "${CONFIG[interp]}"
-    done
-
-  done <<< "$subjects"
-}
-
-main "$@"
+  command -v docker
