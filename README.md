@@ -27,6 +27,38 @@ Input diffusion MRI data must be processed with QSIPrep before running Brain-Cov
 
 The exclusion-flagging step instead takes a compiled CSV of coverage values as input — see How to Run below.
 
+Input data must be organized according to the
+[BIDS standard](https://bids-specification.readthedocs.io/en/stable/) and
+preprocessed with QSIPrep. Scripts expect the following structure, where
+`sub-XXX` is a participant and `ses-YYY` is a session:
+
+```
+QSIPREP_ROOT/
+└── sub-XXX/
+    ├── anat/
+    │   └── sub-XXX_from-MNI152NLin2009cAsym_to-ACPC_mode-image_xfm.h5
+    └── ses-YYY/                      # omit for datasets without sessions
+        └── dwi/
+            ├── sub-XXX_ses-YYY_dir-PA_space-ACPC_desc-preproc_dwi.nii.gz
+            └── sub-XXX_ses-YYY_dir-PA_space-ACPC_dwiref.nii.gz
+```
+
+For datasets without sessions, files sit directly under `sub-XXX/dwi/` and
+file names omit the `ses-YYY` part (e.g.,
+`sub-XXX_dir-PA_space-ACPC_desc-preproc_dwi.nii.gz`).
+
+The MNI-space masks are provided separately (`MNI_MASKS_DIR` and
+`ICBM152_MASK_FILE` in each script's CONFIG):
+
+```
+MNI_MASKS_DIR/
+├── MNI152NLin2009cAsym_superior_cerebrum.nii.gz
+├── MNI152NLin2009cAsym_inferior_cerebrum.nii.gz
+└── MNI152NLin2009cAsym_cerebellum+midbrain.nii.gz
+
+mni_icbm152_t1_tal_nlin_asym_09c_mask.nii
+```
+
 ## How to Run
 
 Brain-Coverage-dseg runs in three steps. Use the `_sessions` version of each script if your dataset has multiple sessions per subject; otherwise use the single-session version.
