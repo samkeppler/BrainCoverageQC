@@ -2,11 +2,14 @@
 """
 Flag participants for inclusion/exclusion based on brain coverage thresholds.
 
-Each applied coverage metric is categorized as full, minimally cropped, or
-cropped using two thresholds per metric. A participant is excluded if they
-fail any applied metric, and flagged as undetermined if they fail none but
-are missing at least one. Summary counts are per participant; a participant
-with several rows (e.g., sessions) is included if at least one row passes.
+Reads the CSV written by the brain coverage scripts. Two metrics are
+available: full-brain coverage (ICBM152 mask) and regional coverage (the
+minimum of the three regional masks). Each applied metric is categorized
+as full, minimally cropped, or cropped using two thresholds per metric.
+A participant is excluded if they fail any applied metric, and flagged as
+undetermined if they fail none but are missing at least one. Summary counts
+are per participant; a participant with several rows (e.g., sessions) is
+included if at least one row passes.
 
 Outputs:
     - CSV of coverage categories, pass/fail per metric, and overall
@@ -29,13 +32,18 @@ OUTPUT_CSV_NAME = "coverage_exclusion_flags.csv"
 
 # Input CSV column names
 ID_COL = "participant_id"
-DATASET_COL = "dataset"  # set to None if the input CSV has no dataset column
+DATASET_COL = None  # set to a column name if the input CSV combines datasets
 
-# Metric -> coverage column
-COVERAGE_COLS = {
-    "full_brain_mask": "coverage_full_brain_mask",
-    "regional_masks": "min_coverage_regional_masks",
-}
+# Coverage column for the full-brain metric
+FULL_BRAIN_COL = "coverage_icbm152"
+
+# Coverage columns for the regional metric, which is their minimum. If any
+# of them is missing for a row, the regional metric is missing for that row.
+REGIONAL_COLS = [
+    "coverage_superior_cerebrum",
+    "coverage_inferior_cerebrum",
+    "coverage_cerebellum_and_midbrain",
+]
 
 # Two coverage thresholds (%) per metric: coverage >= "full" -> full;
 # between "cropped" and "full" -> minimally cropped; below "cropped" ->
@@ -50,7 +58,8 @@ THRESHOLDS = {
 #   "fail" -- grouped with cropped (participant fails that metric)
 MINIMALLY_CROPPED_TREATMENT = "pass"
 
-# Metrics to apply; a participant is excluded if they fail any of these
+# Metrics to apply ("full_brain_mask", "regional_masks"); a participant
+# is excluded if they fail any of these
 METRICS_TO_APPLY = ["full_brain_mask", "regional_masks"]
 
 
@@ -69,8 +78,11 @@ def validate_config():
         )
 
     for metric in METRICS_TO_APPLY:
-        if metric not in COVERAGE_COLS:
-            raise ValueError(f"Metric '{metric}' in METRICS_TO_APPLY has no entry in COVERAGE_COLS")
+        if metric not in ("full_brain_mask", "regional_masks"):
+            raise ValueError(
+                f"Unknown metric '{metric}' in METRICS_TO_APPLY -- "
+                "use 'full_brain_mask' and/or 'regional_masks'"
+            )
         if metric not in THRESHOLDS:
             raise ValueError(f"Metric '{metric}' in METRICS_TO_APPLY has no entry in THRESHOLDS")
 
@@ -92,7 +104,11 @@ def load_input():
     df = pd.read_csv(INPUT_DATA_PATH)
     df.columns = [c.strip() for c in df.columns]
 
-    required = [ID_COL] + [COVERAGE_COLS[m] for m in METRICS_TO_APPLY]
+    required = [ID_COL]
+    if "full_brain_mask" in METRICS_TO_APPLY:
+        required.append(FULL_BRAIN_COL)
+    if "regional_masks" in METRICS_TO_APPLY:
+        required.extend(REGIONAL_COLS)
     if DATASET_COL:
         required.append(DATASET_COL)
 
@@ -106,6 +122,15 @@ def load_input():
 # ----------------------------------------------------------------------
 # FLAGGING
 # ----------------------------------------------------------------------
+def get_metric_coverage(df, metric):
+    """Return coverage (%) for a metric: the full-brain column, or the
+    row-wise minimum of the regional columns (missing if any is missing)."""
+    if metric == "full_brain_mask":
+        return pd.to_numeric(df[FULL_BRAIN_COL], errors="coerce")
+    regional = df[REGIONAL_COLS].apply(pd.to_numeric, errors="coerce")
+    return regional.min(axis=1, skipna=False)
+
+
 def categorize_coverage(coverage, full_threshold, cropped_threshold):
     """Map a numeric coverage Series to 'full' / 'minimally_cropped' /
     'cropped' / 'undetermined' (missing)."""
@@ -128,12 +153,11 @@ def flag_participants(df):
     minimal_flags = pd.DataFrame(index=df.index)
 
     for metric in METRICS_TO_APPLY:
-        col = COVERAGE_COLS[metric]
         thr = THRESHOLDS[metric]
-        coverage = pd.to_numeric(df[col], errors="coerce")
+        coverage = get_metric_coverage(df, metric)
         category = categorize_coverage(coverage, thr["full"], thr["cropped"])
 
-        out[col] = coverage
+        out[f"{metric}_coverage"] = coverage
         out[f"{metric}_category"] = category
 
         fails_this_metric = (category == "cropped") | (
