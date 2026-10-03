@@ -89,9 +89,16 @@ Brain-Coverage-dseg runs in three steps. Use the `_sessions` version of each scr
    ```
    python flag_coverage_exclusions.py
    ```
-   This applies your chosen coverage thresholds to a compiled CSV (one row per subject, with columns `participant_id`, `dataset`, `coverage_full_brain_mask`, and `min_coverage_regional_masks`) and flags each subject as included, excluded, or undetermined.
+   This applies your chosen coverage thresholds to the CSV produced in step 2 (columns `participant_id`, `coverage_icbm152`, `coverage_superior_cerebrum`,`coverage_inferior_cerebrum`, and `coverage_cerebellum_and_midbrain`) and
+   flags each participant as included, excluded, or undetermined.
 
-   Note: `coverage_full_brain_mask` is the `coverage_icbm152` column from step 2's output, and `min_coverage_regional_masks` is the minimum of that output's `coverage_superior_cerebrum`, `coverage_inferior_cerebrum`, and `coverage_cerebellum_and_midbrain` columns. Thresholds, which metrics to apply, and the treatment of borderline ("minimally cropped") cases are set in the script's `CONFIG` block.
+   Two metrics are available: full-brain coverage (`coverage_icbm152`) and regional coverage (the minimum of the three regional columns, computed by the script). Thresholds, which metrics to apply, and the treatment of borderline
+   ("minimally cropped") cases are set in the script's `CONFIG` block.
+
+## Sample data
+
+`sample_data/flag_coverage_exclusions_sample_data.csv` is a **synthetic** example input for the exclusion-flagging script, in the same format the brain coverage scripts produce. All coverage values were randomly generated
+to resemble realistic patterns; they are not real participant data. The file includes one participant with no coverage values and one with a missing regional mask, to show how undetermined participants are handled.
 
 ## Outputs
 
